@@ -418,12 +418,13 @@ class BenchmarkEvaluator:
     """Benchmark 评估器"""
     
     def __init__(self, base_model_path: str, lora_dir: str, expert_dir: str,
-                 router_checkpoint: str, num_experts: int = 8):
+                 router_checkpoint: str, num_experts: int = 8, logger: RealTimeLogger = None):
         self.base_model_path = base_model_path
         self.lora_dir = lora_dir
         self.expert_dir = expert_dir
         self.router_checkpoint = router_checkpoint
         self.num_experts = num_experts
+        self.logger = logger  # 实时日志记录器
         
         self.tokenizer = None
         self.base_model = None
@@ -493,15 +494,28 @@ class BenchmarkEvaluator:
             print(f"!!! Failed to load expert {exp_idx}: {e}")
             return None
         
-        expert_results = {"correct": 0, "total": 0, "by_source": {}}
+        expert_results = {"correct": 0, "total": 0, "by_source": {}, "predictions": []}
+        method_name = "Single Expert (expert_0)"
         
-        for sample in tqdm(test_data, desc=f"Single Expert (expert_0)", leave=False):
+        if self.logger:
+            self.logger.write_method_header(method_name)
+        
+        for idx, sample in enumerate(tqdm(test_data, desc=f"Single Expert (expert_0)", leave=False)):
             prompt = format_prompt(sample["instruction"], sample["source"])
             pred = generate_with_base_model(model, tokenizer, prompt, sigma=sigma)
             
             is_correct = evaluate_answer(pred, sample["output"], sample["source"])
             expert_results["correct"] += int(is_correct)
             expert_results["total"] += 1
+            expert_results["predictions"].append({
+                "idx": idx,
+                "prediction": pred,
+                "is_correct": is_correct
+            })
+            
+            # 实时写入日志
+            if self.logger:
+                self.logger.write_sample(idx, sample, pred, is_correct, method_name)
             
             source = sample["source"]
             if source not in expert_results["by_source"]:
@@ -552,9 +566,13 @@ class BenchmarkEvaluator:
         comix_model.noise_sigma = sigma
         comix_model.clip_threshold = CLIP_THRESHOLD
         
-        results = {"correct": 0, "total": 0, "by_source": {}}
+        results = {"correct": 0, "total": 0, "by_source": {}, "predictions": []}
+        method_name = "Aggregated_A (Local DP)"
         
-        for sample in tqdm(test_data, desc="Aggregated_A (Local DP)"):
+        if self.logger:
+            self.logger.write_method_header(method_name)
+        
+        for idx, sample in enumerate(tqdm(test_data, desc="Aggregated_A (Local DP)")):
             prompt = format_prompt(sample["instruction"], sample["source"])
             # 噪声已在 CoMixLoRALayer 内部对每个专家独立添加
             pred = generate_with_comix(comix_model, tokenizer, prompt, sigma=0)
@@ -562,6 +580,15 @@ class BenchmarkEvaluator:
             is_correct = evaluate_answer(pred, sample["output"], sample["source"])
             results["correct"] += int(is_correct)
             results["total"] += 1
+            results["predictions"].append({
+                "idx": idx,
+                "prediction": pred,
+                "is_correct": is_correct
+            })
+            
+            # 实时写入日志
+            if self.logger:
+                self.logger.write_sample(idx, sample, pred, is_correct, method_name)
             
             source = sample["source"]
             if source not in results["by_source"]:
@@ -584,15 +611,28 @@ class BenchmarkEvaluator:
         comix_model = self.load_comix_model()
         tokenizer = self.load_tokenizer()
         
-        results = {"correct": 0, "total": 0, "by_source": {}}
+        results = {"correct": 0, "total": 0, "by_source": {}, "predictions": []}
+        method_name = "Aggregated_B (Central DP)"
         
-        for sample in tqdm(test_data, desc="Aggregated_B (Central DP)"):
+        if self.logger:
+            self.logger.write_method_header(method_name)
+        
+        for idx, sample in enumerate(tqdm(test_data, desc="Aggregated_B (Central DP)")):
             prompt = format_prompt(sample["instruction"], sample["source"])
             pred = generate_with_comix(comix_model, tokenizer, prompt, sigma=sigma_B)
             
             is_correct = evaluate_answer(pred, sample["output"], sample["source"])
             results["correct"] += int(is_correct)
             results["total"] += 1
+            results["predictions"].append({
+                "idx": idx,
+                "prediction": pred,
+                "is_correct": is_correct
+            })
+            
+            # 实时写入日志
+            if self.logger:
+                self.logger.write_sample(idx, sample, pred, is_correct, method_name)
             
             source = sample["source"]
             if source not in results["by_source"]:
@@ -601,6 +641,92 @@ class BenchmarkEvaluator:
             results["by_source"][source]["total"] += 1
         
         return results
+
+
+# ============================================================================
+#                         实时输出日志类
+# ============================================================================
+
+class RealTimeLogger:
+    """实时写入评估详情的日志类"""
+    
+    def __init__(self, output_path: str):
+        self.output_path = output_path
+        self.file = None
+        
+    def open(self):
+        """打开日志文件"""
+        os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
+        self.file = open(self.output_path, 'w', encoding='utf-8')
+        # 写入文件头
+        self.file.write("=" * 100 + "\n")
+        self.file.write("DP Comparison Benchmark - Detailed Output Log\n")
+        self.file.write(f"Timestamp: {datetime.now().isoformat()}\n")
+        self.file.write("=" * 100 + "\n\n")
+        self.file.flush()
+        
+    def close(self):
+        """关闭日志文件"""
+        if self.file:
+            self.file.close()
+            self.file = None
+    
+    def write_config(self, config: dict):
+        """写入配置信息"""
+        if not self.file:
+            return
+        self.file.write("Configuration:\n")
+        self.file.write("-" * 50 + "\n")
+        for key, value in config.items():
+            self.file.write(f"  {key}: {value}\n")
+        self.file.write("\n")
+        self.file.flush()
+    
+    def write_epsilon_header(self, epsilon: float, sigma: float, sigma_B: float):
+        """写入新 epsilon 的头部"""
+        if not self.file:
+            return
+        eps_str = epsilon_to_str(epsilon)
+        self.file.write("\n" + "=" * 100 + "\n")
+        self.file.write(f"EPSILON = {eps_str}\n")
+        self.file.write(f"Sigma_A (Local DP): {sigma:.6f}\n")
+        self.file.write(f"Sigma_B (Central DP): {sigma_B:.6f}\n")
+        self.file.write("=" * 100 + "\n\n")
+        self.file.flush()
+    
+    def write_method_header(self, method_name: str):
+        """写入方法名称头部"""
+        if not self.file:
+            return
+        self.file.write("\n" + "-" * 80 + "\n")
+        self.file.write(f"Method: {method_name}\n")
+        self.file.write("-" * 80 + "\n\n")
+        self.file.flush()
+    
+    def write_sample(self, idx: int, sample: dict, prediction: str, is_correct: bool, method: str):
+        """写入单个样本的详细信息"""
+        if not self.file:
+            return
+        
+        self.file.write(f"[Sample {idx + 1}] Source: {sample['source']}\n")
+        self.file.write(f"Input:\n{sample['instruction'][:500]}{'...' if len(sample['instruction']) > 500 else ''}\n\n")
+        self.file.write(f"Ground Truth:\n{sample['output']}\n\n")
+        self.file.write(f"Prediction ({method}):\n{prediction}\n\n")
+        self.file.write(f"Correct: {'YES' if is_correct else 'NO'}\n")
+        self.file.write("-" * 40 + "\n\n")
+        self.file.flush()
+    
+    def write_method_summary(self, method_name: str, accuracy: dict):
+        """写入方法的总结统计"""
+        if not self.file:
+            return
+        self.file.write(f"\n>>> {method_name} Summary:\n")
+        self.file.write(f"    Overall Accuracy: {accuracy.get('overall', 0):.2f}%\n")
+        for source in ['gsm8k', 'commonsense_qa', 'strategy_qa']:
+            if source in accuracy:
+                self.file.write(f"    {source}: {accuracy[source]:.2f}%\n")
+        self.file.write("\n")
+        self.file.flush()
 
 
 # ============================================================================
@@ -736,114 +862,157 @@ def main():
     print("Local DP (先加噪再聚合) vs Central DP (先聚合再加噪)")
     print("="*100)
     
-    # 1. 加载测试数据
-    print(f"\n>>> [1/5] Loading test data from {TEST_DATA_PATH}...")
-    test_data = load_test_data(TEST_DATA_PATH, N_TEST_SAMPLES)
+    # 创建输出目录
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # 统计数据分布
-    source_counts = defaultdict(int)
-    for sample in test_data:
-        source_counts[sample["source"]] += 1
+    # 初始化实时日志记录器
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    detail_log_path = os.path.join(OUTPUT_DIR, f"detailed_output_{timestamp}.txt")
+    logger = RealTimeLogger(detail_log_path)
+    logger.open()
+    print(f">>> Real-time log will be written to: {detail_log_path}")
     
-    print(f">>> Loaded {len(test_data)} samples:")
-    for source, count in source_counts.items():
-        print(f"    - {source}: {count}")
-    
-    # 2. 初始化评估器
-    print("\n>>> [2/5] Initializing evaluator...")
-    evaluator = BenchmarkEvaluator(
-        base_model_path=BASE_MODEL,
-        lora_dir=LORA_DIR,
-        expert_dir=EXPERT_DIR,
-        router_checkpoint=ROUTER_CHECKPOINT,
-        num_experts=NUM_EXPERTS
-    )
-    evaluator.load_tokenizer()
-    
-    # 3. 运行评估
-    print("\n>>> [3/5] Running benchmark...")
-    
-    all_results = {
-        "config": {
+    try:
+        # 1. 加载测试数据
+        print(f"\n>>> [1/5] Loading test data from {TEST_DATA_PATH}...")
+        test_data = load_test_data(TEST_DATA_PATH, N_TEST_SAMPLES)
+        
+        # 统计数据分布
+        source_counts = defaultdict(int)
+        for sample in test_data:
+            source_counts[sample["source"]] += 1
+        
+        print(f">>> Loaded {len(test_data)} samples:")
+        for source, count in source_counts.items():
+            print(f"    - {source}: {count}")
+        
+        # 写入配置到日志
+        config = {
             "n_samples": N_TEST_SAMPLES,
             "max_new_tokens": MAX_NEW_TOKENS,
-            "num_queries": MAX_NEW_TOKENS,  # 查询次数 = token 数
-            "privacy_accounting": "RDP (Rényi DP) Composition",
+            "num_queries": MAX_NEW_TOKENS,
+            "privacy_accounting": "RDP (Renyi DP) Composition",
             "epsilons": [epsilon_to_str(e) for e in EPSILONS],
             "delta": DELTA,
             "clip_threshold": CLIP_THRESHOLD,
             "num_experts": NUM_EXPERTS,
-            "source_distribution": dict(source_counts),
-            "timestamp": datetime.now().isoformat()
-        },
-        "results": {}
-    }
-    
-    for epsilon in EPSILONS:
-        eps_str = epsilon_to_str(epsilon)
-        print(f"\n{'='*50}")
-        print(f">>> Evaluating with epsilon = {eps_str}")
-        print(f"{'='*50}")
+            "source_distribution": dict(source_counts)
+        }
+        logger.write_config(config)
         
-        # 计算噪声标准差 (考虑 RDP 组合：MAX_NEW_TOKENS 次查询)
-        # Single Expert 和 Aggregated_A 使用相同的 sigma (基于灵敏度 C)
-        # Aggregated_B (Central DP) 的灵敏度降低为 C/N，因此噪声更小
-        sigma = compute_sigma(epsilon, DELTA, CLIP_THRESHOLD, num_queries=MAX_NEW_TOKENS)
-        sigma_B = compute_sigma(epsilon, DELTA, CLIP_THRESHOLD / NUM_EXPERTS, num_queries=MAX_NEW_TOKENS)
+        # 2. 初始化评估器 (传入 logger)
+        print("\n>>> [2/5] Initializing evaluator...")
+        evaluator = BenchmarkEvaluator(
+            base_model_path=BASE_MODEL,
+            lora_dir=LORA_DIR,
+            expert_dir=EXPERT_DIR,
+            router_checkpoint=ROUTER_CHECKPOINT,
+            num_experts=NUM_EXPERTS,
+            logger=logger  # 传入日志记录器
+        )
+        evaluator.load_tokenizer()
         
-        print(f">>> Sigma_A (Local DP, {MAX_NEW_TOKENS} queries): {sigma:.4f}")
-        print(f">>> Sigma_B (Central DP, {MAX_NEW_TOKENS} queries): {sigma_B:.4f}")
+        # 3. 运行评估
+        print("\n>>> [3/5] Running benchmark...")
         
-        eps_results = {
-            "sigma": sigma,
-            "sigma_B": sigma_B
+        all_results = {
+            "config": {
+                "n_samples": N_TEST_SAMPLES,
+                "max_new_tokens": MAX_NEW_TOKENS,
+                "num_queries": MAX_NEW_TOKENS,  # 查询次数 = token 数
+                "privacy_accounting": "RDP (Rényi DP) Composition",
+                "epsilons": [epsilon_to_str(e) for e in EPSILONS],
+                "delta": DELTA,
+                "clip_threshold": CLIP_THRESHOLD,
+                "num_experts": NUM_EXPERTS,
+                "source_distribution": dict(source_counts),
+                "timestamp": datetime.now().isoformat()
+            },
+            "results": {}
         }
         
-        # 方案 1: Single Expert (expert_0 only)
-        print("\n--- Evaluating Single Expert (expert_0 only) ---")
-        single_results = evaluator.evaluate_single_expert_avg(test_data, sigma)
-        eps_results["single_expert_avg"] = compute_accuracy(single_results)
+        for epsilon in EPSILONS:
+            eps_str = epsilon_to_str(epsilon)
+            print(f"\n{'='*50}")
+            print(f">>> Evaluating with epsilon = {eps_str}")
+            print(f"{'='*50}")
+            
+            # 计算噪声标准差 (考虑 RDP 组合：MAX_NEW_TOKENS 次查询)
+            # Single Expert 和 Aggregated_A 使用相同的 sigma (基于灵敏度 C)
+            # Aggregated_B (Central DP) 的灵敏度降低为 C/N，因此噪声更小
+            sigma = compute_sigma(epsilon, DELTA, CLIP_THRESHOLD, num_queries=MAX_NEW_TOKENS)
+            sigma_B = compute_sigma(epsilon, DELTA, CLIP_THRESHOLD / NUM_EXPERTS, num_queries=MAX_NEW_TOKENS)
+            
+            print(f">>> Sigma_A (Local DP, {MAX_NEW_TOKENS} queries): {sigma:.4f}")
+            print(f">>> Sigma_B (Central DP, {MAX_NEW_TOKENS} queries): {sigma_B:.4f}")
+            
+            # 写入 epsilon 头部到日志
+            logger.write_epsilon_header(epsilon, sigma, sigma_B)
+            
+            eps_results = {
+                "sigma": sigma,
+                "sigma_B": sigma_B
+            }
+            
+            # 方案 1: Single Expert (expert_0 only)
+            print("\n--- Evaluating Single Expert (expert_0 only) ---")
+            single_results = evaluator.evaluate_single_expert_avg(test_data, sigma)
+            single_acc = compute_accuracy(single_results)
+            eps_results["single_expert_avg"] = single_acc
+            if single_acc:
+                logger.write_method_summary("Single Expert (expert_0)", single_acc)
+            
+            # 方案 2: Aggregated_A (Local DP)
+            print("\n--- Evaluating Aggregated_A (Local DP) ---")
+            agg_A_results = evaluator.evaluate_aggregated_A(test_data, sigma)
+            agg_A_acc = compute_accuracy(agg_A_results)
+            eps_results["aggregated_A"] = agg_A_acc
+            if agg_A_acc:
+                logger.write_method_summary("Aggregated_A (Local DP)", agg_A_acc)
+            
+            # 方案 3: Aggregated_B (Central DP)
+            print("\n--- Evaluating Aggregated_B (Central DP) ---")
+            agg_B_results = evaluator.evaluate_aggregated_B(test_data, sigma_B)
+            agg_B_acc = compute_accuracy(agg_B_results)
+            eps_results["aggregated_B"] = agg_B_acc
+            if agg_B_acc:
+                logger.write_method_summary("Aggregated_B (Central DP)", agg_B_acc)
+            
+            # 打印结果表格
+            print_results_table(epsilon, sigma, sigma_B, eps_results)
+            
+            all_results["results"][eps_str] = eps_results
         
-        # 方案 2: Aggregated_A (Local DP)
-        print("\n--- Evaluating Aggregated_A (Local DP) ---")
-        agg_A_results = evaluator.evaluate_aggregated_A(test_data, sigma)
-        eps_results["aggregated_A"] = compute_accuracy(agg_A_results)
+        # 4. 保存结果
+        print("\n>>> [4/5] Saving results...")
         
-        # 方案 3: Aggregated_B (Central DP)
-        print("\n--- Evaluating Aggregated_B (Central DP) ---")
-        agg_B_results = evaluator.evaluate_aggregated_B(test_data, sigma_B)
-        eps_results["aggregated_B"] = compute_accuracy(agg_B_results)
+        output_json = os.path.join(OUTPUT_DIR, "benchmark_results.json")
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        print(f">>> Results saved to {output_json}")
         
-        # 打印结果表格
-        print_results_table(epsilon, sigma, sigma_B, eps_results)
+        # 5. 生成可视化
+        print("\n>>> [5/5] Generating plots...")
+        output_plot = os.path.join(OUTPUT_DIR, "benchmark_comparison.png")
+        plot_results(all_results["results"], output_plot)
         
-        all_results["results"][eps_str] = eps_results
+        # 打印总结
+        print("\n" + "="*100)
+        print(">>> Benchmark Complete!")
+        print("="*100)
+        print("\n>>> Summary:")
+        print("  - Local DP (Aggregated_A): 每个专家独立加噪后聚合")
+        print("  - Central DP (Aggregated_B): 使用 Router 加权聚合后统一加噪")
+        print(f"  - 噪声比例: Sigma_A / Sigma_B = {NUM_EXPERTS} (专家数量)")
+        print(f"\n>>> Output files:")
+        print(f"    - {output_json}")
+        print(f"    - {output_plot}")
+        print(f"    - {detail_log_path} (detailed output log)")
     
-    # 4. 保存结果
-    print("\n>>> [4/5] Saving results...")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
-    output_json = os.path.join(OUTPUT_DIR, "benchmark_results.json")
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
-    print(f">>> Results saved to {output_json}")
-    
-    # 5. 生成可视化
-    print("\n>>> [5/5] Generating plots...")
-    output_plot = os.path.join(OUTPUT_DIR, "benchmark_comparison.png")
-    plot_results(all_results["results"], output_plot)
-    
-    # 打印总结
-    print("\n" + "="*100)
-    print(">>> Benchmark Complete!")
-    print("="*100)
-    print("\n>>> Summary:")
-    print("  - Local DP (Aggregated_A): 每个专家独立加噪后聚合")
-    print("  - Central DP (Aggregated_B): 使用 Router 加权聚合后统一加噪")
-    print(f"  - 噪声比例: Sigma_A / Sigma_B = {NUM_EXPERTS} (专家数量)")
-    print(f"\n>>> Output files:")
-    print(f"    - {output_json}")
-    print(f"    - {output_plot}")
+    finally:
+        # 确保日志文件被正确关闭
+        logger.close()
+        print(f"\n>>> Detailed log saved to: {detail_log_path}")
 
 
 if __name__ == "__main__":
